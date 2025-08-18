@@ -7,12 +7,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
 	"mime/multipart"
 	"net/http"
 	"os"
 	"strconv"
 	"time"
+
+	"k8s.io/klog/v2"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promhttp"
@@ -21,6 +22,8 @@ import (
 const (
 	apiBaseURL = "https://api.enphaseenergy.com/api/v4"
 )
+
+var buildTime string // will be set at build with -ldflags
 
 type enphaseMetricsCollector struct {
 	loadMetric    *prometheus.Desc
@@ -47,8 +50,8 @@ func GetEnvMust(key string) string {
 	if val, ok := os.LookupEnv(key); ok {
 		return val
 	}
-	log.Fatalf("Missing required environment variable %s", key)
-	panic("UNREACHABLE")
+	klog.Fatalf("Missing required environment variable %s", key)
+	return "" // UNREACHABLE
 }
 
 func GetEnvDefault(key string, dflt string) string {
@@ -65,15 +68,15 @@ func NewEnphaseMetricsCollector(ctx context.Context) *enphaseMetricsCollector {
 	gatewayIP := GetEnvMust("ENPHASE_GATEWAY_IP")
 	verbose, err := strconv.ParseBool(GetEnvDefault("VERBOSE", "false"))
 	if err != nil {
-		log.Fatalf("Failed to parse VERBOSE from environment: %v", err)
+		klog.Fatalf("Failed to parse VERBOSE from environment: %v", err)
 	}
 
 	token, err := getToken(user, password, envoySerial)
 	if err != nil {
-		log.Fatalf("Failed to get token: %v", err)
+		klog.Fatalf("Failed to get token: %v", err)
 	}
 	if verbose {
-		log.Printf("Token: %s", token)
+		klog.Infof("Token: %s", token)
 	}
 
 	return &enphaseMetricsCollector{
@@ -124,7 +127,7 @@ func getToken(user, password, envoySerial string) (string, error) {
 
 	var loginRespData map[string]interface{}
 	if err := json.Unmarshal(bodyBytes, &loginRespData); err != nil {
-		log.Printf("Login response body: %s", string(bodyBytes))
+		klog.Infof("Login response body: %s", string(bodyBytes))
 		return "", fmt.Errorf("failed to decode login response: %v", err)
 	}
 
@@ -166,10 +169,10 @@ func (c *enphaseMetricsCollector) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (c *enphaseMetricsCollector) Collect(ch chan<- prometheus.Metric) {
-	log.Println("Collecting metrics")
+	klog.Infoln("Collecting metrics")
 	err := c.fetchDataFromGateway(ch)
 	if err != nil {
-		log.Panicf("Failed to fetch data from API: %v", err)
+		klog.Fatalf("Failed to fetch data from API: %v", err)
 	}
 }
 
@@ -206,7 +209,7 @@ func (c *enphaseMetricsCollector) fetchResponseFromGateway(cmd string, verbose b
 	}
 
 	if verbose {
-		log.Printf("Response to cmd %s body: %s", cmd, string(bodyBytes))
+		klog.Infof("Response to cmd %s body: %s", cmd, string(bodyBytes))
 	}
 
 	return bodyBytes, nil
@@ -224,7 +227,7 @@ func (c *enphaseMetricsCollector) fetchDataFromGateway(ch chan<- prometheus.Metr
 	if err != nil {
 		return fmt.Errorf("failed to parse report data: %v", err)
 	}
-	log.Printf("Last update: %s", lastUpdate)
+	klog.Infof("Last update: %s", lastUpdate)
 
 	loadMetric := prometheus.MustNewConstMetric(c.loadMetric, prometheus.GaugeValue, float64(consNow))
 	loadMetric = prometheus.NewMetricWithTimestamp(lastUpdate, loadMetric)
@@ -252,7 +255,7 @@ func (c *enphaseMetricsCollector) parseReportData(body []byte) (time.Time, float
 		return time.Time{}, 0, 0, 0, 0, fmt.Errorf("failed to unmarshal response: %v", err)
 	}
 	if c.verbose {
-		log.Printf("reports: \n%v", reports)
+		klog.Infof("reports: \n%v", reports)
 	}
 
 	var totalConsumptionCurrW, totalConsumptionWhDlvdCum float64
@@ -281,12 +284,17 @@ func (c *enphaseMetricsCollector) parseReportData(body []byte) (time.Time, float
 }
 
 func main() {
+	if buildTime == "" {
+		buildTime = "unknown"
+	}
+	klog.Infof("Build time: %s\n", buildTime)
+
 	enphaseCollector := NewEnphaseMetricsCollector(context.Background())
 	pr := prometheus.NewRegistry()
 	pr.MustRegister(enphaseCollector)
 
 	http.Handle("/metrics", promhttp.HandlerFor(pr, promhttp.HandlerOpts{}))
 
-	log.Println("Starting server on :9100")
-	log.Fatal(http.ListenAndServe(":9100", nil))
+	klog.Infoln("Starting server on :9100")
+	klog.Fatal(http.ListenAndServe(":9100", nil))
 }
