@@ -14,6 +14,9 @@ RUN CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -ldflags="-w -s -X main.build
 # STEP 2 build a small image
 ###################################
 FROM scratch
+# TODO: runs as root (uid 0) — scratch has no /etc/passwd so there's no user
+# to switch to. Static binary needs no privileged port; worth a distroless
+# nonroot base or an explicit numeric UID if this ever gets revisited.
 COPY --from=builder /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=builder /app/enphase-exporter /enphase-exporter
 EXPOSE 9100

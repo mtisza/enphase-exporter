@@ -25,6 +25,11 @@ const (
 
 var buildTime string // will be set at build with -ldflags
 
+// gatewayScrapeTimeout must stay comfortably under Prometheus's scrape_timeout
+// (10s, the cluster default) so a slow/dead gateway fails via our own error
+// path instead of Prometheus just severing the connection.
+const gatewayScrapeTimeout = 5 * time.Second
+
 type enphaseMetricsCollector struct {
 	loadMetric    *prometheus.Desc
 	prodMetric    *prometheus.Desc
@@ -33,6 +38,7 @@ type enphaseMetricsCollector struct {
 	token         string
 	gatewayIP     string
 	verbose       bool
+	httpClient    *http.Client
 }
 
 type Cumulative struct {
@@ -76,7 +82,7 @@ func NewEnphaseMetricsCollector(ctx context.Context) *enphaseMetricsCollector {
 		klog.Fatalf("Failed to get token: %v", err)
 	}
 	if verbose {
-		klog.Infof("Token: %s", token)
+		klog.Infof("Token acquired (%d bytes, redacted)", len(token))
 	}
 
 	return &enphaseMetricsCollector{
@@ -99,10 +105,22 @@ func NewEnphaseMetricsCollector(ctx context.Context) *enphaseMetricsCollector {
 		token:     token,
 		gatewayIP: gatewayIP,
 		verbose:   verbose,
+		httpClient: &http.Client{
+			Timeout: gatewayScrapeTimeout,
+			Transport: &http.Transport{
+				// The gateway is on the local network and presents a
+				// self-signed cert; there's no CA to verify it against.
+				TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
+			},
+		},
 	}
 }
 
 func getToken(user, password, envoySerial string) (string, error) {
+	// Startup-only calls, not scrape-gated, but still shouldn't hang forever
+	// if Enphase's cloud is unreachable.
+	client := &http.Client{Timeout: 15 * time.Second}
+
 	// First request to login and get session_id
 	var loginData bytes.Buffer
 	writer := multipart.NewWriter(&loginData)
@@ -110,7 +128,7 @@ func getToken(user, password, envoySerial string) (string, error) {
 	writer.WriteField("user[password]", password)
 	writer.Close()
 
-	loginResp, err := http.Post(
+	loginResp, err := client.Post(
 		"https://enlighten.enphaseenergy.com/login/login.json?",
 		writer.FormDataContentType(),
 		&loginData,
@@ -147,7 +165,7 @@ func getToken(user, password, envoySerial string) (string, error) {
 		return "", fmt.Errorf("failed to marshal token data: %v", err)
 	}
 
-	tokenResp, err := http.Post("https://entrez.enphaseenergy.com/tokens", "application/json", bytes.NewBuffer(tokenDataJSON))
+	tokenResp, err := client.Post("https://entrez.enphaseenergy.com/tokens", "application/json", bytes.NewBuffer(tokenDataJSON))
 	if err != nil {
 		return "", fmt.Errorf("failed to get token: %v", err)
 	}
@@ -171,7 +189,7 @@ func (c *enphaseMetricsCollector) Describe(ch chan<- *prometheus.Desc) {
 func (c *enphaseMetricsCollector) Collect(ch chan<- prometheus.Metric) {
 	klog.Infoln("Collecting metrics")
 	if err := c.fetchDataFromGateway(ch); err != nil {
-		klog.Errorf("Failed to fetch data from API: %v", err)
+		klog.Fatalf("Failed to fetch data from API: %v", err)
 	}
 }
 
@@ -185,14 +203,7 @@ func (c *enphaseMetricsCollector) fetchResponseFromGateway(cmd string, verbose b
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", c.token))
 
-	// Create a custom HTTP client with TLS configuration to skip certificate verification
-	client := &http.Client{
-		Transport: &http.Transport{
-			TLSClientConfig: &tls.Config{InsecureSkipVerify: true},
-		},
-	}
-
-	resp, err := client.Do(req)
+	resp, err := c.httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("failed to perform request: %v", err)
 	}
