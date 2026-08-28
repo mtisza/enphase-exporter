@@ -170,9 +170,8 @@ func (c *enphaseMetricsCollector) Describe(ch chan<- *prometheus.Desc) {
 
 func (c *enphaseMetricsCollector) Collect(ch chan<- prometheus.Metric) {
 	klog.Infoln("Collecting metrics")
-	err := c.fetchDataFromGateway(ch)
-	if err != nil {
-		klog.Fatalf("Failed to fetch data from API: %v", err)
+	if err := c.fetchDataFromGateway(ch); err != nil {
+		klog.Errorf("Failed to fetch data from API: %v", err)
 	}
 }
 
@@ -223,64 +222,43 @@ func (c *enphaseMetricsCollector) fetchDataFromGateway(ch chan<- prometheus.Metr
 	if err != nil {
 		return fmt.Errorf("failed to fetch response for cmd %s: %v", cmd, err)
 	}
-	lastUpdate, consNow, consCum, prodNow, prodCum, err := c.parseReportData(bodyBytes)
+	consNow, consCum, consUpdatedAt, prodNow, prodCum, prodUpdatedAt, err := c.parseReportData(bodyBytes)
 	if err != nil {
 		return fmt.Errorf("failed to parse report data: %v", err)
 	}
-	klog.Infof("Last update: %s", lastUpdate)
+	klog.Infof("Production last update: %s, consumption last update: %s", prodUpdatedAt, consUpdatedAt)
 
-	loadMetric := prometheus.MustNewConstMetric(c.loadMetric, prometheus.GaugeValue, float64(consNow))
-	loadMetric = prometheus.NewMetricWithTimestamp(lastUpdate, loadMetric)
-
-	cumLoadMetric := prometheus.MustNewConstMetric(c.cumLoadMetric, prometheus.CounterValue, float64(consCum))
-	cumLoadMetric = prometheus.NewMetricWithTimestamp(lastUpdate, cumLoadMetric)
-
-	prodMetric := prometheus.MustNewConstMetric(c.prodMetric, prometheus.GaugeValue, float64(prodNow))
-	prodMetric = prometheus.NewMetricWithTimestamp(lastUpdate, prodMetric)
-
-	cumProdMetric := prometheus.MustNewConstMetric(c.cumProdMetric, prometheus.CounterValue, float64(prodCum))
-	cumProdMetric = prometheus.NewMetricWithTimestamp(lastUpdate, cumProdMetric)
-
-	ch <- loadMetric
-	ch <- prodMetric
-	ch <- cumLoadMetric
-	ch <- cumProdMetric
+	ch <- prometheus.MustNewConstMetric(c.loadMetric, prometheus.GaugeValue, consNow)
+	ch <- prometheus.MustNewConstMetric(c.cumLoadMetric, prometheus.CounterValue, consCum)
+	ch <- prometheus.MustNewConstMetric(c.prodMetric, prometheus.GaugeValue, prodNow)
+	ch <- prometheus.MustNewConstMetric(c.cumProdMetric, prometheus.CounterValue, prodCum)
 
 	return nil
 }
 
-func (c *enphaseMetricsCollector) parseReportData(body []byte) (time.Time, float64, float64, float64, float64, error) {
+func (c *enphaseMetricsCollector) parseReportData(body []byte) (consNow, consCum float64, consUpdatedAt time.Time, prodNow, prodCum float64, prodUpdatedAt time.Time, err error) {
 	var reports []Report
 	if err := json.Unmarshal(body, &reports); err != nil {
-		return time.Time{}, 0, 0, 0, 0, fmt.Errorf("failed to unmarshal response: %v", err)
+		return 0, 0, time.Time{}, 0, 0, time.Time{}, fmt.Errorf("failed to unmarshal response: %v", err)
 	}
 	if c.verbose {
 		klog.Infof("reports: \n%v", reports)
 	}
 
-	var totalConsumptionCurrW, totalConsumptionWhDlvdCum float64
-	var totalConsumptionCreatedAt time.Time
-	var productionCurrW, productionWhDlvdCum float64
-	var productionCreatedAt time.Time
-
 	for _, report := range reports {
 		switch report.ReportType {
 		case "total-consumption":
-			totalConsumptionCurrW = report.Cumulative.CurrW
-			totalConsumptionWhDlvdCum = report.Cumulative.WhDlvdCum
-			totalConsumptionCreatedAt = time.Unix(report.CreatedAt, 0)
+			consNow = report.Cumulative.CurrW
+			consCum = report.Cumulative.WhDlvdCum
+			consUpdatedAt = time.Unix(report.CreatedAt, 0)
 		case "production":
-			productionCurrW = report.Cumulative.CurrW
-			productionWhDlvdCum = report.Cumulative.WhDlvdCum
-			productionCreatedAt = time.Unix(report.CreatedAt, 0)
+			prodNow = report.Cumulative.CurrW
+			prodCum = report.Cumulative.WhDlvdCum
+			prodUpdatedAt = time.Unix(report.CreatedAt, 0)
 		}
 	}
 
-	if !productionCreatedAt.Equal(totalConsumptionCreatedAt) {
-		return time.Time{}, 0, 0, 0, 0, fmt.Errorf("production and total consumption reports have different timestamps")
-	}
-
-	return productionCreatedAt, totalConsumptionCurrW, totalConsumptionWhDlvdCum, productionCurrW, productionWhDlvdCum, nil
+	return consNow, consCum, consUpdatedAt, prodNow, prodCum, prodUpdatedAt, nil
 }
 
 func main() {
