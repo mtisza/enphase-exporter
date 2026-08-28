@@ -25,20 +25,25 @@ const (
 
 var buildTime string // will be set at build with -ldflags
 
-// gatewayScrapeTimeout must stay comfortably under Prometheus's scrape_timeout
-// (10s, the cluster default) so a slow/dead gateway fails via our own error
-// path instead of Prometheus just severing the connection.
-const gatewayScrapeTimeout = 5 * time.Second
+// gatewayScrapeTimeout is a generous backstop, not a tuned value yet — see
+// enphase_gateway_request_duration_seconds for the real call-time
+// distribution to size this against. It's well above Prometheus's own
+// scrape_timeout (10s, the cluster default), so a call that runs past that
+// but under this will complete successfully in the app without crashing,
+// while that one Prometheus scrape still times out and shows as failed —
+// only calls that blow past gatewayScrapeTimeout itself crash the process.
+const gatewayScrapeTimeout = 60 * time.Second
 
 type enphaseMetricsCollector struct {
-	loadMetric    *prometheus.Desc
-	prodMetric    *prometheus.Desc
-	cumLoadMetric *prometheus.Desc
-	cumProdMetric *prometheus.Desc
-	token         string
-	gatewayIP     string
-	verbose       bool
-	httpClient    *http.Client
+	loadMetric     *prometheus.Desc
+	prodMetric     *prometheus.Desc
+	cumLoadMetric  *prometheus.Desc
+	cumProdMetric  *prometheus.Desc
+	gatewayReqTime *prometheus.Desc
+	token          string
+	gatewayIP      string
+	verbose        bool
+	httpClient     *http.Client
 }
 
 type Cumulative struct {
@@ -100,6 +105,10 @@ func NewEnphaseMetricsCollector(ctx context.Context) *enphaseMetricsCollector {
 		),
 		cumProdMetric: prometheus.NewDesc("enphase_cumulative_production",
 			"cumulative solar production",
+			nil, nil,
+		),
+		gatewayReqTime: prometheus.NewDesc("enphase_gateway_request_duration_seconds",
+			"duration of the HTTP request to the local Envoy gateway",
 			nil, nil,
 		),
 		token:     token,
@@ -184,6 +193,7 @@ func (c *enphaseMetricsCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.prodMetric
 	ch <- c.cumLoadMetric
 	ch <- c.cumProdMetric
+	ch <- c.gatewayReqTime
 }
 
 func (c *enphaseMetricsCollector) Collect(ch chan<- prometheus.Metric) {
@@ -229,7 +239,11 @@ func (c *enphaseMetricsCollector) fetchDataFromGateway(ch chan<- prometheus.Metr
 	var cmd string
 
 	cmd = "ivp/meters/reports/"
+	start := time.Now()
 	bodyBytes, err := c.fetchResponseFromGateway(cmd, c.verbose)
+	reqDuration := time.Since(start)
+	klog.Infof("Gateway request for cmd %s took %s", cmd, reqDuration)
+	ch <- prometheus.MustNewConstMetric(c.gatewayReqTime, prometheus.GaugeValue, reqDuration.Seconds())
 	if err != nil {
 		return fmt.Errorf("failed to fetch response for cmd %s: %v", cmd, err)
 	}
