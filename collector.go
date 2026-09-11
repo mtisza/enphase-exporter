@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"mime/multipart"
@@ -29,10 +30,18 @@ var buildTime string // will be set at build with -ldflags
 // enphase_gateway_request_duration_seconds for the real call-time
 // distribution to size this against. It's well above Prometheus's own
 // scrape_timeout (10s, the cluster default), so a call that runs past that
-// but under this will complete successfully in the app without crashing,
-// while that one Prometheus scrape still times out and shows as failed —
-// only calls that blow past gatewayScrapeTimeout itself crash the process.
+// but under this still completes successfully here, while that one
+// Prometheus scrape times out and shows as failed. A call that blows past
+// this timeout fails the scrape and sets enphase_up to 0; it no longer takes
+// the process down with it.
 const gatewayScrapeTimeout = 60 * time.Second
+
+// errGatewayUnauthorized marks the one failure that a retry can actually fix:
+// the Envoy rejecting our bearer token. Tokens are minted at startup and are
+// good for months, so this is rare — but it is also the one error that never
+// clears on its own, which is why it gets a sentinel and a re-auth path
+// instead of being lumped in with transient network failures.
+var errGatewayUnauthorized = errors.New("gateway rejected token")
 
 type enphaseMetricsCollector struct {
 	loadMetric     *prometheus.Desc
@@ -40,10 +49,22 @@ type enphaseMetricsCollector struct {
 	cumLoadMetric  *prometheus.Desc
 	cumProdMetric  *prometheus.Desc
 	gatewayReqTime *prometheus.Desc
+	upMetric       *prometheus.Desc
 	token          string
 	gatewayIP      string
 	verbose        bool
 	httpClient     *http.Client
+
+	// Kept so the token can be re-minted in-process when the gateway starts
+	// rejecting it. Before this existed the only way to get a fresh token was
+	// to crash and let Kubernetes restart the pod.
+	user        string
+	password    string
+	envoySerial string
+
+	// Indirection over getToken purely so the re-auth path can be exercised
+	// in tests without calling Enphase's cloud. Always getToken in production.
+	mintToken func(user, password, envoySerial string) (string, error)
 }
 
 type Cumulative struct {
@@ -111,9 +132,17 @@ func NewEnphaseMetricsCollector(ctx context.Context) *enphaseMetricsCollector {
 			"duration of the HTTP request to the local Envoy gateway",
 			nil, nil,
 		),
-		token:     token,
-		gatewayIP: gatewayIP,
-		verbose:   verbose,
+		upMetric: prometheus.NewDesc("enphase_up",
+			"1 if the last scrape of the Envoy gateway succeeded, 0 otherwise",
+			nil, nil,
+		),
+		token:       token,
+		gatewayIP:   gatewayIP,
+		verbose:     verbose,
+		user:        user,
+		password:    password,
+		envoySerial: envoySerial,
+		mintToken:   getToken,
 		httpClient: &http.Client{
 			Timeout: gatewayScrapeTimeout,
 			Transport: &http.Transport{
@@ -194,13 +223,37 @@ func (c *enphaseMetricsCollector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- c.cumLoadMetric
 	ch <- c.cumProdMetric
 	ch <- c.gatewayReqTime
+	ch <- c.upMetric
 }
 
 func (c *enphaseMetricsCollector) Collect(ch chan<- prometheus.Metric) {
 	klog.Infoln("Collecting metrics")
-	if err := c.fetchDataFromGateway(ch); err != nil {
-		klog.Fatalf("Failed to fetch data from API: %v", err)
+
+	// A failed scrape must not kill the process. The Envoy drops off the
+	// network for hours at a time (multi-hour outages on 2026-08-27..29 and
+	// again 2026-09-11), and exiting on the first failed fetch turned every
+	// one of those into a CrashLoopBackOff — 33 restarts in 2.5h on 09-11,
+	// paging at 03:54 local about a pod, when the real event was "the solar
+	// gateway is unreachable".
+	//
+	// This used to be klog.Fatalf, and that was load-bearing: it was the only
+	// way an expired token ever got replaced, since one is minted at startup
+	// and never refreshed. Simply downgrading it to an error (as commit
+	// 3b7cc40 did, reverted by 6131e57) trades a noisy crash loop for a
+	// permanently silent exporter. The re-auth path in
+	// fetchReportsWithTokenRefresh replaces that mechanism properly, and
+	// enphase_up below is what makes a stuck exporter visible without it
+	// having to die to get attention.
+	err := c.fetchDataFromGateway(ch)
+	if err != nil {
+		klog.Errorf("Failed to fetch data from API: %v", err)
 	}
+
+	up := 0.0
+	if err == nil {
+		up = 1.0
+	}
+	ch <- prometheus.MustNewConstMetric(c.upMetric, prometheus.GaugeValue, up)
 }
 
 func (c *enphaseMetricsCollector) fetchResponseFromGateway(cmd string, verbose bool) ([]byte, error) {
@@ -219,6 +272,10 @@ func (c *enphaseMetricsCollector) fetchResponseFromGateway(cmd string, verbose b
 	}
 	defer resp.Body.Close()
 
+	if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+		return nil, fmt.Errorf("%w: status %d", errGatewayUnauthorized, resp.StatusCode)
+	}
+
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
@@ -235,13 +292,41 @@ func (c *enphaseMetricsCollector) fetchResponseFromGateway(cmd string, verbose b
 	return bodyBytes, nil
 }
 
-func (c *enphaseMetricsCollector) fetchDataFromGateway(ch chan<- prometheus.Metric) error {
-	var cmd string
-
-	cmd = "ivp/meters/reports/"
+// fetchReportsWithTokenRefresh performs the gateway call, and if the gateway
+// rejects our token, mints a new one and retries exactly once. This is what
+// the old crash-and-restart behaviour was really accomplishing; doing it in
+// process means a stale token costs one extra round trip instead of a pod
+// restart, and means a genuinely unreachable gateway no longer gets the same
+// treatment as an expired credential.
+//
+// The returned duration covers only the gateway call whose result is being
+// returned, so a re-auth never inflates
+// enphase_gateway_request_duration_seconds.
+func (c *enphaseMetricsCollector) fetchReportsWithTokenRefresh(cmd string) ([]byte, time.Duration, error) {
 	start := time.Now()
 	bodyBytes, err := c.fetchResponseFromGateway(cmd, c.verbose)
-	reqDuration := time.Since(start)
+	elapsed := time.Since(start)
+
+	if err == nil || !errors.Is(err, errGatewayUnauthorized) {
+		return bodyBytes, elapsed, err
+	}
+
+	klog.Warningf("Gateway rejected the token (%v), re-authenticating", err)
+	token, tokenErr := c.mintToken(c.user, c.password, c.envoySerial)
+	if tokenErr != nil {
+		return nil, elapsed, fmt.Errorf("re-authentication failed after %v: %v", err, tokenErr)
+	}
+	c.token = token
+	klog.Infof("Re-authenticated (%d bytes, redacted)", len(token))
+
+	start = time.Now()
+	bodyBytes, err = c.fetchResponseFromGateway(cmd, c.verbose)
+	return bodyBytes, time.Since(start), err
+}
+
+func (c *enphaseMetricsCollector) fetchDataFromGateway(ch chan<- prometheus.Metric) error {
+	cmd := "ivp/meters/reports/"
+	bodyBytes, reqDuration, err := c.fetchReportsWithTokenRefresh(cmd)
 	klog.Infof("Gateway request for cmd %s took %s", cmd, reqDuration)
 	ch <- prometheus.MustNewConstMetric(c.gatewayReqTime, prometheus.GaugeValue, reqDuration.Seconds())
 	if err != nil {
